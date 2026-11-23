@@ -1,0 +1,192 @@
+# SiteRef's commercial-safe COLMAP for Windows.
+#
+# Same recipe as build-windows.yml, with everything that isn't licensed for
+# commercial use left out:
+#   * no SiftGPU (non-commercial): CUDA_ENABLED=OFF and OPENGL_ENABLED=OFF
+#     keep GPU_ENABLED off, so src/thirdparty/SiftGPU is never compiled;
+#   * no LSD (AGPL), no CGAL (GPL), no SuiteSparse (GPL parts): Ceres uses
+#     Eigen's sparse solver instead (vcpkg.json);
+#   * no GUI/Qt, no MVS, no download support (SiteRef bundles its models).
+# ONNX Runtime (MIT) stays for LightGlue/ALIKED, CPU only for now; its CUDA
+# and TensorRT provider DLLs are removed from the package.
+#
+# It doesn't use upstream's vcpkg binary cache (that is for COLMAP's own CI);
+# it keeps its own in GitHub's Actions cache instead.
+
+name: SiteRef COLMAP (Windows)
+
+on:
+  push:
+    branches:
+      - siteref-*
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows Release, commercial-safe
+    runs-on: windows-2025-vs2026
+
+    env:
+      VCPKG_TAG: "2026.10.16"
+      VCPKG_CACHE_DIR: ${{ github.workspace }}/vcpkg-cache
+      COMPILER_CACHE_DIR: ${{ github.workspace }}/compiler-cache
+      CCACHE_DIR: ${{ github.workspace }}/compiler-cache/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 300M
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        id: vcpkg-cache
+        with:
+          path: ${{ env.VCPKG_CACHE_DIR }}
+          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+          restore-keys: siteref-vcpkg-${{ env.VCPKG_TAG }}-
+
+      - name: Use the local vcpkg binary cache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ env.VCPKG_CACHE_DIR }}" | Out-Null
+          echo "VCPKG_BINARY_SOURCES=clear;files,${{ env.VCPKG_CACHE_DIR }},readwrite" >> "${env:GITHUB_ENV}"
+
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
+        id: cache-compiler
+        with:
+          mode: restore
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          key-suffix: windows-siteref
+
+      - name: Install compile cache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ env.CCACHE_DIR }}"
+          echo "${{ env.COMPILER_CACHE_DIR }}/bin" | Out-File -Encoding utf8 -Append -FilePath $env:GITHUB_PATH
+          if (!(Test-Path -PathType Leaf "${{ env.COMPILER_CACHE_DIR }}/bin/ccache.exe")) {
+            .github/workflows/install-ccache.ps1 -Destination "${{ env.COMPILER_CACHE_DIR }}/bin"
+          }
+          & "${{ env.COMPILER_CACHE_DIR }}/bin/ccache.exe" --zero-stats
+
+      - name: Setup vcpkg (pinned release)
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          git clone --branch ${{ env.VCPKG_TAG }} --depth 1 https://github.com/microsoft/vcpkg
+          cd vcpkg
+          ./bootstrap-vcpkg.bat
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "4.3.2"
+          ninjaVersion: "1.12.1"
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          ./vcpkg/vcpkg.exe integrate install
+          mkdir -Force build
+          cd build
+          cmake .. `
+            -GNinja `
+            -DCOLMAP_HASH_MAP_BACKEND=BOOST `
+            -DCMAKE_MAKE_PROGRAM=ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DTESTS_ENABLED=OFF `
+            -DCUDA_ENABLED=OFF `
+            -DOPENGL_ENABLED=OFF `
+            -DGUI_ENABLED=OFF `
+            -DMVS_ENABLED=OFF `
+            -DLSD_ENABLED=OFF `
+            -DCGAL_ENABLED=OFF `
+            -DDOWNLOAD_ENABLED=OFF `
+            -DONNX_ENABLED=ON `
+            -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release `
+            -DVCPKG_USE_LEGACY_APPLOCAL=ON `
+            -DCMAKE_INSTALL_PREFIX=install
+          ninja
+
+      - name: Export package
+        shell: pwsh
+        run: |
+          ./vcpkg/vcpkg.exe integrate install
+          cd build
+          ninja install
+          ../vcpkg/vcpkg.exe install --triplet=x64-windows-release --x-no-default-features
+          ../vcpkg/vcpkg.exe export --raw --output-dir vcpkg_export --output colmap
+          cp vcpkg_export/colmap/installed/x64-windows/bin/*.dll install/bin -ErrorAction SilentlyContinue
+          cp vcpkg_export/colmap/installed/x64-windows-release/bin/*.dll install/bin
+          # CPU only for now: the CUDA/TensorRT providers are hundreds of MB and
+          # COLMAP only asks for them when built with CUDA.
+          Remove-Item -Force -ErrorAction SilentlyContinue install/bin/onnxruntime_providers_cuda.dll, install/bin/onnxruntime_providers_tensorrt.dll
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue install/include,install/lib,install/share
+          # Licence texts of what's bundled, for SiteRef's THIRD_PARTY_LICENSES.md.
+          New-Item -ItemType Directory -Force -Path install/licenses | Out-Null
+          cp ../COPYING.txt install/licenses/COLMAP-COPYING.txt
+          Get-ChildItem vcpkg_export/colmap/installed/x64-windows-release/share -Recurse -Filter copyright |
+            ForEach-Object { cp $_.FullName ("install/licenses/" + $_.Directory.Name + ".txt") }
+
+      - name: Check nothing non-commercial or copyleft got in
+        shell: pwsh
+        run: |
+          cd build
+          $bad = @()
+          if (Test-Path src/thirdparty/SiftGPU) { $bad += "SiftGPU was built (build/src/thirdparty/SiftGPU exists)" }
+          if (Test-Path src/thirdparty/LSD) { $bad += "LSD was built" }
+          foreach ($pat in '*cholmod*', '*spqr*', '*suitesparse*', '*CGAL*', '*gmp*', '*mpfr*', 'Qt6*', '*glew*', '*providers_cuda*', '*providers_tensorrt*') {
+            $hits = Get-ChildItem install -Recurse -Filter $pat -ErrorAction SilentlyContinue
+            foreach ($h in $hits) { $bad += "unexpected file: $($h.FullName)" }
+          }
+          $cache = Get-Content CMakeCache.txt
+          foreach ($opt in 'CUDA_ENABLED:BOOL=OFF', 'OPENGL_ENABLED:BOOL=OFF', 'LSD_ENABLED:BOOL=OFF', 'CGAL_ENABLED:BOOL=OFF') {
+            if (-not ($cache -contains $opt)) { $bad += "CMakeCache.txt lacks $opt" }
+          }
+          if ($bad.Count) { $bad | ForEach-Object { Write-Error $_ }; exit 1 }
+          ./install/bin/colmap.exe help | Select-Object -First 3
+          Write-Host "Package contents:"
+          Get-ChildItem install -Recurse -File | Sort-Object Length -Descending |
+            ForEach-Object { "{0,10:N0} KB  {1}" -f ($_.Length / 1KB), $_.FullName.Substring((Resolve-Path install).Path.Length + 1) }
+          $total = (Get-ChildItem install -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host ("Total: {0:N1} MB" -f ($total / 1MB))
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: colmap-x64-windows-siteref
+          path: build/install
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_CACHE_DIR }}
+          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+
+      - name: Cleanup compiler cache
+        if: always()
+        shell: pwsh
+        run: |
+          ccache --cleanup
+          ccache --show-stats --verbose
+
+      - name: Save compiler cache
+        if: always()
+        uses: ./.github/actions/compiler-cache
+        with:
+          mode: save
+          key: ${{ steps.cache-compiler.outputs.key }}
+          path: ${{ env.COMPILER_CACHE_DIR }}
+          cache-hit: ${{ steps.cache-compiler.outputs.cache-hit }}
