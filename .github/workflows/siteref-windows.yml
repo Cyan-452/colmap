@@ -167,6 +167,14 @@ jobs:
           cp ../COPYING.txt install/licenses/COLMAP-COPYING.txt
           Get-ChildItem vcpkg_export/colmap/installed/x64-windows-release/share -Recurse -Filter copyright |
             ForEach-Object { cp $_.FullName ("install/licenses/" + $_.Directory.Name + ".txt") }
+          # Libraries COLMAP fetches itself and links in statically (faiss for the vocabulary tree, PoseLib, ...):
+          # their notices are in the fetched sources, not vcpkg's share folder
+          Get-ChildItem _deps -Directory -Filter *-src | ForEach-Object {
+            $lic = Get-ChildItem $_.FullName -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING)' } | Select-Object -First 1
+            if ($lic) { cp $lic.FullName ("install/licenses/" + ($_.Name -replace '-src$', '') + ".txt") }
+            else { Write-Host "::warning::no licence file found in $($_.Name)" }
+          }
+          Get-ChildItem install/licenses | Select-Object -ExpandProperty Name
 
       - name: Check nothing non-commercial or copyleft got in
         shell: pwsh
