@@ -8,8 +8,12 @@
 #     Eigen's sparse solver instead (vcpkg.json), and so does COLMAP's own
 #     sparse Cholesky (CHOLMOD_ENABLED=OFF, a SiteRef patch);
 #   * no GUI/Qt, no MVS, no download support (SiteRef bundles its models).
-# ONNX Runtime (MIT) stays for LightGlue/ALIKED, CPU only for now; its CUDA
-# and TensorRT provider DLLs are removed from the package.
+# ONNX Runtime (MIT, for LightGlue/ALIKED) is left out for now: COLMAP fetches
+# it from github.com/microsoft/onnxruntime, which returns 404 (2026-11-24).
+# It can come back from NuGet (Microsoft.ML.OnnxRuntime) later.
+#
+# The last lines of a failed step's log go into an error annotation, which
+# GitHub's API shows without signing in (logs need a signed-in user).
 #
 # It doesn't use upstream's vcpkg binary cache (that is for COLMAP's own CI);
 # it keeps its own in GitHub's Actions cache instead.
@@ -40,6 +44,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 300M
+      SITEREF_LOG: ${{ github.workspace }}/siteref-build.log
 
     steps:
       - uses: actions/checkout@v7
@@ -49,8 +54,8 @@ jobs:
         id: vcpkg-cache
         with:
           path: ${{ env.VCPKG_CACHE_DIR }}
-          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
-          restore-keys: siteref-vcpkg-${{ env.VCPKG_TAG }}-
+          key: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+          restore-keys: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-
 
       - name: Use the local vcpkg binary cache
         shell: pwsh
@@ -101,14 +106,15 @@ jobs:
           ./vcpkg/vcpkg.exe install `
             --triplet=x64-windows-release `
             --x-no-default-features `
-            --x-install-root=build/vcpkg_installed
+            --x-install-root=build/vcpkg_installed 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Save vcpkg binary cache
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.VCPKG_CACHE_DIR }}
-          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+          key: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
 
       - name: Configure and build
         shell: pwsh
@@ -132,13 +138,15 @@ jobs:
             -DCGAL_ENABLED=OFF `
             -DCHOLMOD_ENABLED=OFF `
             -DDOWNLOAD_ENABLED=OFF `
-            -DONNX_ENABLED=ON `
+            -DONNX_ENABLED=OFF `
             -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-release `
             -DVCPKG_USE_LEGACY_APPLOCAL=ON `
-            -DCMAKE_INSTALL_PREFIX=install
-          ninja
+            -DCMAKE_INSTALL_PREFIX=install 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ninja 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Export package
         shell: pwsh
@@ -182,6 +190,16 @@ jobs:
             ForEach-Object { "{0,10:N0} KB  {1}" -f ($_.Length / 1KB), $_.FullName.Substring((Resolve-Path install).Path.Length + 1) }
           $total = (Get-ChildItem install -Recurse -File | Measure-Object Length -Sum).Sum
           Write-Host ("Total: {0:N1} MB" -f ($total / 1MB))
+
+      - name: Report the error (readable without signing in)
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path $env:SITEREF_LOG) {
+            $tail = (Get-Content $env:SITEREF_LOG -Tail 80) -join "`n"
+            $msg = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Last lines of the build log::$msg"
+          }
 
       - name: Upload package
         uses: actions/upload-artifact@v7
