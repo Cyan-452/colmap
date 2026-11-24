@@ -91,7 +91,13 @@ find_package(Glew ${COLMAP_FIND_TYPE})
 
 find_package(Git)
 
-find_package(CHOLMOD REQUIRED)
+if(CHOLMOD_ENABLED)
+    find_package(CHOLMOD REQUIRED)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_CHOLMOD_ENABLED)
+    message(STATUS "Enabling CHOLMOD support")
+else()
+    message(STATUS "Disabling CHOLMOD support (sparse Cholesky uses Eigen's SimplicialLDLT)")
+endif()
 
 # Ceres and glog expose gflags::gflags in their interface dependencies, but gflags
 # only defines the namespaced target when GFLAGS_USE_TARGET_NAMESPACE is ON. Bridge

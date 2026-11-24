@@ -5,7 +5,8 @@
 #   * no SiftGPU (non-commercial): CUDA_ENABLED=OFF and OPENGL_ENABLED=OFF
 #     keep GPU_ENABLED off, so src/thirdparty/SiftGPU is never compiled;
 #   * no LSD (AGPL), no CGAL (GPL), no SuiteSparse (GPL parts): Ceres uses
-#     Eigen's sparse solver instead (vcpkg.json);
+#     Eigen's sparse solver instead (vcpkg.json), and so does COLMAP's own
+#     sparse Cholesky (CHOLMOD_ENABLED=OFF, a SiteRef patch);
 #   * no GUI/Qt, no MVS, no download support (SiteRef bundles its models).
 # ONNX Runtime (MIT) stays for LightGlue/ALIKED, CPU only for now; its CUDA
 # and TensorRT provider DLLs are removed from the package.
@@ -90,6 +91,25 @@ jobs:
           cmakeVersion: "4.3.2"
           ninjaVersion: "1.12.1"
 
+      # Its own step, so the libraries (about 45 minutes from scratch) reach
+      # the cache even if configuring or building COLMAP fails afterwards.
+      - name: Build the libraries (vcpkg)
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          ./vcpkg/vcpkg.exe install `
+            --triplet=x64-windows-release `
+            --x-no-default-features `
+            --x-install-root=build/vcpkg_installed
+
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_CACHE_DIR }}
+          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+
       - name: Configure and build
         shell: pwsh
         run: |
@@ -110,6 +130,7 @@ jobs:
             -DMVS_ENABLED=OFF `
             -DLSD_ENABLED=OFF `
             -DCGAL_ENABLED=OFF `
+            -DCHOLMOD_ENABLED=OFF `
             -DDOWNLOAD_ENABLED=OFF `
             -DONNX_ENABLED=ON `
             -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON `
@@ -151,7 +172,7 @@ jobs:
             foreach ($h in $hits) { $bad += "unexpected file: $($h.FullName)" }
           }
           $cache = Get-Content CMakeCache.txt
-          foreach ($opt in 'CUDA_ENABLED:BOOL=OFF', 'OPENGL_ENABLED:BOOL=OFF', 'LSD_ENABLED:BOOL=OFF', 'CGAL_ENABLED:BOOL=OFF') {
+          foreach ($opt in 'CUDA_ENABLED:BOOL=OFF', 'OPENGL_ENABLED:BOOL=OFF', 'LSD_ENABLED:BOOL=OFF', 'CGAL_ENABLED:BOOL=OFF', 'CHOLMOD_ENABLED:BOOL=OFF') {
             if (-not ($cache -contains $opt)) { $bad += "CMakeCache.txt lacks $opt" }
           }
           if ($bad.Count) { $bad | ForEach-Object { Write-Error $_ }; exit 1 }
@@ -167,13 +188,6 @@ jobs:
         with:
           name: colmap-x64-windows-siteref
           path: build/install
-
-      - name: Save vcpkg binary cache
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.VCPKG_CACHE_DIR }}
-          key: siteref-vcpkg-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
 
       - name: Cleanup compiler cache
         if: always()
