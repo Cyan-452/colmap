@@ -44,9 +44,12 @@ jobs:
   # upstream's build-windows.yml does, with the CUDA runtime linked in
   # statically, so the package gains one small exe and no NVIDIA libraries.
   # It runs beside the COLMAP build; the package job puts the two together.
+  # It builds on the VS 2022 image with a host compiler CUDA 13.2 supports:
+  # on windows-2025-vs2026 (MSVC 14.52, newer than CUDA 13.2 knows) cudafe++
+  # crashed with 0xC0000005 even with -allow-unsupported-compiler.
   gpumatch:
     name: GPU matcher (CUDA)
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2022
     env:
       BUILD_LOG: ${{ github.workspace }}/gpumatch-build.log
     steps:
@@ -60,7 +63,7 @@ jobs:
           method: network
           # upstream's list (build-windows.yml): CUDA 13's compiler needs crt,
           # nvvm, nvptxcompiler and thrust (the CCCL headers cuda_runtime.h
-          # pulls in); without thrust, cudafe++ crashed (0xC0000005)
+          # pulls in)
           sub-packages: '["nvcc", "crt", "nvvm", "nvptxcompiler", "thrust", "nvtx", "cudart", "curand", "curand_dev", "nvrtc_dev"]'
 
       - name: Install CMake and Ninja
@@ -72,10 +75,22 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          ./scripts/shell/enter_vs_dev_shell.ps1
+          # the newest installed MSVC toolset that CUDA 13.2 supports (up to
+          # VS 2022's 14.4x), listed in the log with the others
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $tools = foreach ($vs in (& $vswhere -all -products * -format json | ConvertFrom-Json)) {
+            Get-ChildItem "$($vs.installationPath)/VC/Tools/MSVC" -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object { [pscustomobject]@{ vs = $vs; ver = [version]$_.Name } }
+          }
+          $tools | Sort-Object ver -Descending | ForEach-Object { "MSVC $($_.ver) in $($_.vs.installationPath)" } |
+            Tee-Object -FilePath $env:BUILD_LOG -Append
+          $pick = $tools | Where-Object { $_.ver -lt [version]'14.50' } | Sort-Object ver -Descending | Select-Object -First 1
+          if (-not $pick) { "No MSVC toolset older than 14.50 here (CUDA 13.2 supports up to 14.4x)" | Tee-Object -FilePath $env:BUILD_LOG -Append; exit 1 }
+          Import-Module "$($pick.vs.installationPath)/Common7/Tools/Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstanceId $pick.vs.instanceId -SkipAutomaticLocation `
+            -DevCmdArguments "-no_logo -arch=amd64 -host_arch=amd64 -vcvars_ver=$($pick.ver)"
           cd ${{ github.workspace }}
-          # the runner's MSVC is newer than CUDA 13.2's host_config.h lists (as for upstream's CUDA build)
-          $env:CUDAFLAGS = "-allow-unsupported-compiler"
+          "Using MSVC $($pick.ver): $((Get-Command cl.exe).Source)" | Tee-Object -FilePath $env:BUILD_LOG -Append
           cmake -S gpumatch -B build-gpumatch -GNinja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_CUDA_ARCHITECTURES=all-major `
             -DCUDAToolkit_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" `
