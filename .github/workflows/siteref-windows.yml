@@ -144,7 +144,7 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE: build-4.2.1-gpu-1
+      RELEASE: build-4.2.1-gpu-2
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -383,6 +383,43 @@ jobs:
         with:
           path: build/install
           key: ${{ steps.pkg.outputs.cache-primary-key }}
+
+      # Run every time (also when the built COLMAP came from the cache), after
+      # the cache is saved, so the cache holds only COLMAP's own install.
+      # colmap.exe, ceres.dll and openblas.dll need the Visual C++ runtime and
+      # OpenMP (msvcp140, vcruntime140, vcomp140); they go beside them
+      # (app-local, as Visual Studio's redistributable files allow), so a PC
+      # without the VC++ Redistributable installed can run them.
+      - name: Add the Visual C++ runtime and the remaining licence texts
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          $redist = Join-Path $env:VCToolsRedistDir 'x64'
+          Write-Host "Redist: $redist"
+          $crt = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.CRT' | Select-Object -First 1
+          $omp = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.OpenMP' | Select-Object -First 1
+          if (-not $crt -or -not $omp) { Write-Error "no CRT/OpenMP redist folders in $redist"; exit 1 }
+          Get-ChildItem $crt.FullName, $omp.FullName -Filter *.dll | ForEach-Object { cp $_.FullName build/install/bin; "added $($_.Name)" }
+          # compiled into colmap.exe from src/thirdparty (not vcpkg packages)
+          cp src/thirdparty/VLFeat/LICENSE build/install/licenses/vlfeat.txt
+          cp src/thirdparty/PoissonRecon/LICENSE build/install/licenses/poissonrecon.txt
+          # GCC 16.2 runtimes beside LAPACK (libgcc_s, libgfortran: GPL-3.0 with
+          # the runtime library exception; libquadmath: LGPL-2.1+)
+          cp packaging/licenses/*.txt build/install/licenses/
+          # every DLL any file in bin imports must be beside it or part of Windows
+          # (the runner has the VC++ runtime installed, so those count as missing
+          # unless they're in bin)
+          $missing = @()
+          foreach ($f in Get-ChildItem build/install/bin -Include *.exe, *.dll -Recurse) {
+            foreach ($d in (dumpbin /dependents $f.FullName | Select-String '^\s+\S+\.dll$' | ForEach-Object { $_.Line.Trim() })) {
+              if (Test-Path (Join-Path build/install/bin $d)) { continue }
+              $vcrt = $d -match '^(msvcp|vcruntime|vcomp|concrt|vccorlib)\d'
+              if ($vcrt -or -not (Test-Path (Join-Path $env:SystemRoot "System32/$d"))) { $missing += "$($f.Name) needs $d" }
+            }
+          }
+          if ($missing) { $missing | ForEach-Object { Write-Error $_ }; exit 1 }
+          Get-ChildItem build/install/licenses | Select-Object -ExpandProperty Name
 
       - name: Upload package
         uses: actions/upload-artifact@v7
