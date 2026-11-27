@@ -415,7 +415,8 @@ jobs:
           $missing = @()
           foreach ($f in Get-ChildItem build/install/bin -Include *.exe, *.dll -Recurse) {
             foreach ($d in (dumpbin /dependents $f.FullName | Select-String '^\s+\S+\.dll$' | ForEach-Object { $_.Line.Trim() })) {
-              if (Test-Path (Join-Path build/install/bin $d)) { continue }
+              # api-ms-win-*: Windows' API sets (the Universal C runtime, part of Windows 10 and 11), not files
+              if ($d -match '^api-ms-win-' -or (Test-Path (Join-Path build/install/bin $d))) { continue }
               $vcrt = $d -match '^(msvcp|vcruntime|vcomp|concrt|vccorlib)\d'
               if ($vcrt -or -not (Test-Path (Join-Path $env:SystemRoot "System32/$d"))) { $missing += "$($f.Name) needs $d" }
             }
