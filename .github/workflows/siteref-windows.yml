@@ -7,7 +7,9 @@
 #   * no LSD (AGPL), no CGAL (GPL), no SuiteSparse (GPL parts): Ceres uses
 #     Eigen's sparse solver instead (vcpkg.json), and so does COLMAP's own
 #     sparse Cholesky (CHOLMOD_ENABLED=OFF, a patch on this branch);
-#   * no GUI/Qt, no MVS, no download support (model files are bundled separately).
+#   * no GUI/Qt, no MVS, no download support (model files are bundled separately);
+#   * no Fortran: LAPACK is OpenBLAS's C translation (cmake/vcpkg/ports/README.md),
+#     so no GCC/MinGW runtime DLLs (libquadmath is LGPL) ship.
 # ONNX Runtime (MIT, for LightGlue/ALIKED) is left out for now: COLMAP fetches
 # it from github.com/microsoft/onnxruntime, which returns 404 (2026-11-24).
 # It can come back from NuGet (Microsoft.ML.OnnxRuntime) later.
@@ -144,7 +146,7 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE: build-4.2.1-gpu-2
+      RELEASE: build-4.2.1-gpu-3
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -406,9 +408,11 @@ jobs:
           # compiled into colmap.exe from src/thirdparty (not vcpkg packages)
           cp src/thirdparty/VLFeat/LICENSE build/install/licenses/vlfeat.txt
           cp src/thirdparty/PoissonRecon/LICENSE build/install/licenses/poissonrecon.txt
-          # GCC 16.2 runtimes beside LAPACK (libgcc_s, libgfortran: GPL-3.0 with
-          # the runtime library exception; libquadmath: LGPL-2.1+)
-          cp packaging/licenses/*.txt build/install/licenses/
+          # LAPACK comes from OpenBLAS's C translation (cmake/vcpkg/ports), so no
+          # Fortran LAPACK or GCC/MinGW runtime may be in the package
+          $fortran = Get-ChildItem build/install/bin -Filter *.dll | Where-Object { $_.Name -match '^(liblapack|libgfortran|libquadmath|libgcc_s|libwinpthread)' }
+          if ($fortran) { Write-Output "::error title=Fortran runtime in the package::$($fortran.Name -join ', ')"; exit 1 }
+          foreach ($lic in 'lapack-reference', 'vcpkg-gfortran') { Remove-Item -ErrorAction SilentlyContinue "build/install/licenses/$lic.txt" }
           # every DLL any file in bin imports must be beside it or part of Windows
           # (the runner has the VC++ runtime installed, so those count as missing
           # unless they're in bin)

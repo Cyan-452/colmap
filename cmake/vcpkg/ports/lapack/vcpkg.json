@@ -1,0 +1,27 @@
+{
+  "$comment": "Keep the platform expressions in sync with the wrappers installed by the portfiles!",
+  "name": "lapack",
+  "version-date": "2023-06-10",
+  "port-version": 100,
+  "description": "Metapackage for packages which provide LAPACK",
+  "license": null,
+  "supports": "!android",
+  "dependencies": [
+    {
+      "name": "clapack",
+      "platform": "!osx & !ios & (uwp | (arm & windows) | (static & windows & !mingw))"
+    },
+    {
+      "name": "lapack-reference",
+      "platform": "!osx & !ios & (!uwp & !(arm & windows) & !(static & windows & !mingw)) & !(windows & x64 & !mingw & !static)"
+    },
+    {
+      "name": "openblas",
+      "platform": "windows & x64 & !mingw & !uwp & !static"
+    },
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    }
+  ]
+}
