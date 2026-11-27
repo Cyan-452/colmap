@@ -29,8 +29,6 @@ on:
   push:
     branches:
       - siteref-*
-    tags:
-      - build-*
   workflow_dispatch:
 
 # A new push waits for the running build rather than cancelling it, so a long
@@ -134,14 +132,19 @@ jobs:
           path: install-gpumatch/bin/colmap-gpumatch.exe
 
   # COLMAP and the GPU matcher in one package: colmap-x64-windows-commercial.
-  # On a build-* tag it is also published as a pre-release on this repo,
-  # so it can be downloaded (and pinned by SHA-256) without signing in.
+  # The first green build of each RELEASE below is also published as a
+  # pre-release on this repo (the release makes the tag), so it can be
+  # downloaded and pinned by SHA-256 without signing in. Bump RELEASE to
+  # publish a new one. It's published from the branch build because a tag
+  # push can't use the branch's build caches and would rebuild everything.
   package:
     name: Package
     needs: [build, gpumatch]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE: build-4.2.1-gpu-1
     steps:
       - uses: actions/download-artifact@v7
         with:
@@ -162,15 +165,18 @@ jobs:
         with:
           name: colmap-x64-windows-commercial
           path: package
-      - name: Publish the pre-release (build-* tags only)
-        if: startsWith(github.ref, 'refs/tags/build-')
+      - name: Publish the pre-release (once per RELEASE)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
+          tag="$RELEASE"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag is already published; bump RELEASE to publish this build"
+            exit 0
+          fi
           sha=$(cut -d' ' -f1 colmap-x64-windows-commercial.zip.sha256)
           gh release create "$tag" colmap-x64-windows-commercial.zip colmap-x64-windows-commercial.zip.sha256 \
-            --repo "$GITHUB_REPOSITORY" --prerelease --title "COLMAP commercial-safe package ($tag)" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "COLMAP commercial-safe package ($tag)" \
             --notes "COLMAP 4.2.1 for Windows without SiftGPU, LSD, CGAL, SuiteSparse, Qt or CUDA libraries, with the gpumatch CUDA matcher (bin/colmap-gpumatch.exe), from commit $GITHUB_SHA. SHA-256 of the zip: $sha"
 
   build:
