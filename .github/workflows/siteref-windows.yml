@@ -33,9 +33,11 @@ on:
       - build-*
   workflow_dispatch:
 
+# A new push waits for the running build rather than cancelling it, so a long
+# library build always finishes and reaches the cache.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   # The GPU matcher (gpumatch/): CUDA 13.2, installed as
@@ -56,7 +58,10 @@ jobs:
         with:
           cuda: '13.2.0'
           method: network
-          sub-packages: '["nvcc", "crt", "nvvm", "nvptxcompiler", "cudart"]'
+          # upstream's list (build-windows.yml): CUDA 13's compiler needs crt,
+          # nvvm, nvptxcompiler and thrust (the CCCL headers cuda_runtime.h
+          # pulls in); without thrust, cudafe++ crashed (0xC0000005)
+          sub-packages: '["nvcc", "crt", "nvvm", "nvptxcompiler", "thrust", "nvtx", "cudart", "curand", "curand_dev", "nvrtc_dev"]'
 
       - name: Install CMake and Ninja
         uses: lukka/get-cmake@latest
@@ -167,11 +172,22 @@ jobs:
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 300M
       BUILD_LOG: ${{ github.workspace }}/colmap-build.log
+      # bump to rebuild COLMAP when only this file's build settings change
+      COLMAP_BUILD_REV: "1"
 
     steps:
       - uses: actions/checkout@v7
 
+      # COLMAP built before from the same sources and settings: skip building it
+      - name: Restore the built COLMAP
+        uses: actions/cache/restore@v4
+        id: pkg
+        with:
+          path: build/install
+          key: cs-colmap-install-${{ env.COLMAP_BUILD_REV }}-${{ env.VCPKG_TAG }}-${{ hashFiles('src/**', 'cmake/**', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json') }}
+
       - name: Restore vcpkg binary cache
+        if: steps.pkg.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         id: vcpkg-cache
         with:
@@ -180,12 +196,14 @@ jobs:
           restore-keys: cs-vcpkg-v2-${{ env.VCPKG_TAG }}-
 
       - name: Use the local vcpkg binary cache
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "${{ env.VCPKG_CACHE_DIR }}" | Out-Null
           echo "VCPKG_BINARY_SOURCES=clear;files,${{ env.VCPKG_CACHE_DIR }},readwrite" >> "${env:GITHUB_ENV}"
 
       - name: Restore compiler cache
+        if: steps.pkg.outputs.cache-hit != 'true'
         uses: ./.github/actions/compiler-cache
         id: cache-compiler
         with:
@@ -194,6 +212,7 @@ jobs:
           key-suffix: windows-cs
 
       - name: Install compile cache
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "${{ env.CCACHE_DIR }}"
@@ -204,6 +223,7 @@ jobs:
           & "${{ env.COMPILER_CACHE_DIR }}/bin/ccache.exe" --zero-stats
 
       - name: Setup vcpkg (pinned release)
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           ./scripts/shell/enter_vs_dev_shell.ps1
@@ -213,6 +233,7 @@ jobs:
           ./bootstrap-vcpkg.bat
 
       - name: Install CMake and Ninja
+        if: steps.pkg.outputs.cache-hit != 'true'
         uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "4.3.2"
@@ -221,6 +242,7 @@ jobs:
       # Its own step, so the libraries (about 45 minutes from scratch) reach
       # the cache even if configuring or building COLMAP fails afterwards.
       - name: Build the libraries (vcpkg)
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           ./scripts/shell/enter_vs_dev_shell.ps1
@@ -232,13 +254,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Save vcpkg binary cache
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        if: steps.pkg.outputs.cache-hit != 'true' && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.VCPKG_CACHE_DIR }}
           key: cs-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
 
       - name: Configure and build
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           ./scripts/shell/enter_vs_dev_shell.ps1
@@ -271,6 +294,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Export package
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           ./vcpkg/vcpkg.exe integrate install
@@ -299,6 +323,7 @@ jobs:
           Get-ChildItem install/licenses | Select-Object -ExpandProperty Name
 
       - name: Check nothing non-commercial or copyleft got in
+        if: steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           cd build
@@ -331,6 +356,13 @@ jobs:
             Write-Output "::error title=Last lines of the build log::$msg"
           }
 
+      - name: Save the built COLMAP
+        if: steps.pkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/install
+          key: ${{ steps.pkg.outputs.cache-primary-key }}
+
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
@@ -338,14 +370,14 @@ jobs:
           path: build/install
 
       - name: Cleanup compiler cache
-        if: always()
+        if: always() && steps.pkg.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           ccache --cleanup
           ccache --show-stats --verbose
 
       - name: Save compiler cache
-        if: always()
+        if: always() && steps.pkg.outputs.cache-hit != 'true'
         uses: ./.github/actions/compiler-cache
         with:
           mode: save
