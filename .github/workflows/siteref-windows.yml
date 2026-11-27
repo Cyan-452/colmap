@@ -393,13 +393,15 @@ jobs:
       - name: Add the Visual C++ runtime and the remaining licence texts
         shell: pwsh
         run: |
+          trap { Write-Output "::error title=Visual C++ runtime and licences::$_ (line $($_.InvocationInfo.ScriptLineNumber))"; exit 1 }
           ./scripts/shell/enter_vs_dev_shell.ps1
           cd ${{ github.workspace }}
+          Write-Host "VCToolsRedistDir: $env:VCToolsRedistDir"
           $redist = Join-Path $env:VCToolsRedistDir 'x64'
-          Write-Host "Redist: $redist"
-          $crt = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.CRT' | Select-Object -First 1
-          $omp = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.OpenMP' | Select-Object -First 1
-          if (-not $crt -or -not $omp) { Write-Error "no CRT/OpenMP redist folders in $redist"; exit 1 }
+          if (Test-Path $redist) { Get-ChildItem $redist -Directory | ForEach-Object { "  $($_.Name)" } }
+          $crt = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.CRT' -ErrorAction SilentlyContinue | Select-Object -First 1
+          $omp = Get-ChildItem $redist -Directory -Filter 'Microsoft.VC*.OpenMP' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $crt -or -not $omp) { Write-Output "::error title=Visual C++ runtime::no CRT/OpenMP redist folders in '$redist'"; exit 1 }
           Get-ChildItem $crt.FullName, $omp.FullName -Filter *.dll | ForEach-Object { cp $_.FullName build/install/bin; "added $($_.Name)" }
           # compiled into colmap.exe from src/thirdparty (not vcpkg packages)
           cp src/thirdparty/VLFeat/LICENSE build/install/licenses/vlfeat.txt
@@ -418,7 +420,7 @@ jobs:
               if ($vcrt -or -not (Test-Path (Join-Path $env:SystemRoot "System32/$d"))) { $missing += "$($f.Name) needs $d" }
             }
           }
-          if ($missing) { $missing | ForEach-Object { Write-Error $_ }; exit 1 }
+          if ($missing) { Write-Output "::error title=Missing DLLs::$($missing -join '; ')"; exit 1 }
           Get-ChildItem build/install/licenses | Select-Object -ExpandProperty Name
 
       - name: Upload package
