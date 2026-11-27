@@ -1,4 +1,4 @@
-# SiteRef's commercial-safe COLMAP for Windows.
+# A commercial-safe COLMAP build for Windows.
 #
 # Same recipe as build-windows.yml, with everything that isn't licensed for
 # commercial use left out:
@@ -6,11 +6,16 @@
 #     keep GPU_ENABLED off, so src/thirdparty/SiftGPU is never compiled;
 #   * no LSD (AGPL), no CGAL (GPL), no SuiteSparse (GPL parts): Ceres uses
 #     Eigen's sparse solver instead (vcpkg.json), and so does COLMAP's own
-#     sparse Cholesky (CHOLMOD_ENABLED=OFF, a SiteRef patch);
-#   * no GUI/Qt, no MVS, no download support (SiteRef bundles its models).
+#     sparse Cholesky (CHOLMOD_ENABLED=OFF, a patch on this branch);
+#   * no GUI/Qt, no MVS, no download support (model files are bundled separately).
 # ONNX Runtime (MIT, for LightGlue/ALIKED) is left out for now: COLMAP fetches
 # it from github.com/microsoft/onnxruntime, which returns 404 (2026-11-24).
 # It can come back from NuGet (Microsoft.ML.OnnxRuntime) later.
+#
+# GPU: gpumatch/ (CUDA, NVIDIA cards) matches the CPU-extracted SIFT
+# features and writes them to COLMAP's database, where COLMAP's
+# geometric_verifier checks them. It's built by the gpumatch job and
+# shipped as bin/colmap-gpumatch.exe in the same package.
 #
 # The last lines of a failed step's log go into an error annotation, which
 # GitHub's API shows without signing in (logs need a signed-in user).
@@ -18,12 +23,14 @@
 # It doesn't use upstream's vcpkg binary cache (that is for COLMAP's own CI);
 # it keeps its own in GitHub's Actions cache instead.
 
-name: SiteRef COLMAP (Windows)
+name: COLMAP commercial-safe (Windows)
 
 on:
   push:
     branches:
       - siteref-*
+    tags:
+      - build-*
   workflow_dispatch:
 
 concurrency:
@@ -31,6 +38,121 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The GPU matcher (gpumatch/): CUDA 13.2, installed as
+  # upstream's build-windows.yml does, with the CUDA runtime linked in
+  # statically, so the package gains one small exe and no NVIDIA libraries.
+  # It runs beside the COLMAP build; the package job puts the two together.
+  gpumatch:
+    name: GPU matcher (CUDA)
+    runs-on: windows-2025-vs2026
+    env:
+      BUILD_LOG: ${{ github.workspace }}/gpumatch-build.log
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: '13.2.0'
+          method: network
+          sub-packages: '["nvcc", "crt", "nvvm", "nvptxcompiler", "cudart"]'
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "4.3.2"
+          ninjaVersion: "1.12.1"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          # the runner's MSVC is newer than CUDA 13.2's host_config.h lists (as for upstream's CUDA build)
+          $env:CUDAFLAGS = "-allow-unsupported-compiler"
+          cmake -S gpumatch -B build-gpumatch -GNinja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=all-major `
+            -DCUDAToolkit_ROOT="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" `
+            -DCMAKE_INSTALL_PREFIX=install-gpumatch 2>&1 | Tee-Object -FilePath $env:BUILD_LOG -Append
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ninja -C build-gpumatch install 2>&1 | Tee-Object -FilePath $env:BUILD_LOG -Append
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check it needs no CUDA or C runtime libraries, and starts
+        shell: pwsh
+        run: |
+          ./scripts/shell/enter_vs_dev_shell.ps1
+          cd ${{ github.workspace }}
+          $exe = "install-gpumatch/bin/colmap-gpumatch.exe"
+          $deps = dumpbin /dependents $exe | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          Write-Host "Depends on: $($deps -join ', ')"
+          $bad = $deps | Where-Object { $_ -match '^(cudart|cublas|cudnn|nvrtc|msvcp|vcruntime)' }
+          if ($bad) { Write-Error "unexpected DLLs: $($bad -join ', ')"; exit 1 }
+          Write-Host ("Size: {0:N0} KB" -f ((Get-Item $exe).Length / 1KB))
+          # no GPU here: it must say so and exit 2 (callers then use COLMAP's CPU matcher)
+          $out = & $exe --check
+          $code = $LASTEXITCODE
+          Write-Host "--check: $out (exit $code)"
+          if ($code -ne 2 -or "$out" -notmatch '"ok":false') { Write-Error "--check should report no usable GPU on the runner"; exit 1 }
+          $global:LASTEXITCODE = 0
+
+      - name: Report the error (readable without signing in)
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path $env:BUILD_LOG) {
+            $tail = (Get-Content $env:BUILD_LOG -Tail 80) -join "`n"
+            $msg = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Last lines of the GPU matcher build log::$msg"
+          }
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: colmap-gpumatch
+          path: install-gpumatch/bin/colmap-gpumatch.exe
+
+  # COLMAP and the GPU matcher in one package: colmap-x64-windows-commercial.
+  # On a build-* tag it is also published as a pre-release on this repo,
+  # so it can be downloaded (and pinned by SHA-256) without signing in.
+  package:
+    name: Package
+    needs: [build, gpumatch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: colmap-cpu
+          path: package
+      - uses: actions/download-artifact@v7
+        with:
+          name: colmap-gpumatch
+          path: package/bin
+      - name: List, zip and hash
+        run: |
+          ls -la package/bin/colmap-gpumatch.exe package/bin/colmap.exe
+          du -sh package
+          (cd package && zip -qr9 ../colmap-x64-windows-commercial.zip .)
+          ls -la colmap-x64-windows-commercial.zip
+          sha256sum colmap-x64-windows-commercial.zip | tee colmap-x64-windows-commercial.zip.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: colmap-x64-windows-commercial
+          path: package
+      - name: Publish the pre-release (build-* tags only)
+        if: startsWith(github.ref, 'refs/tags/build-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          sha=$(cut -d' ' -f1 colmap-x64-windows-commercial.zip.sha256)
+          gh release create "$tag" colmap-x64-windows-commercial.zip colmap-x64-windows-commercial.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --prerelease --title "COLMAP commercial-safe package ($tag)" \
+            --notes "COLMAP 4.2.1 for Windows without SiftGPU, LSD, CGAL, SuiteSparse, Qt or CUDA libraries, with the gpumatch CUDA matcher (bin/colmap-gpumatch.exe), from commit $GITHUB_SHA. SHA-256 of the zip: $sha"
+
   build:
     name: Windows Release, commercial-safe
     runs-on: windows-2025-vs2026
@@ -44,7 +166,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 300M
-      SITEREF_LOG: ${{ github.workspace }}/siteref-build.log
+      BUILD_LOG: ${{ github.workspace }}/colmap-build.log
 
     steps:
       - uses: actions/checkout@v7
@@ -54,8 +176,8 @@ jobs:
         id: vcpkg-cache
         with:
           path: ${{ env.VCPKG_CACHE_DIR }}
-          key: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
-          restore-keys: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-
+          key: cs-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+          restore-keys: cs-vcpkg-v2-${{ env.VCPKG_TAG }}-
 
       - name: Use the local vcpkg binary cache
         shell: pwsh
@@ -69,7 +191,7 @@ jobs:
         with:
           mode: restore
           path: ${{ env.COMPILER_CACHE_DIR }}
-          key-suffix: windows-siteref
+          key-suffix: windows-cs
 
       - name: Install compile cache
         shell: pwsh
@@ -106,7 +228,7 @@ jobs:
           ./vcpkg/vcpkg.exe install `
             --triplet=x64-windows-release `
             --x-no-default-features `
-            --x-install-root=build/vcpkg_installed 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+            --x-install-root=build/vcpkg_installed 2>&1 | Tee-Object -FilePath $env:BUILD_LOG -Append
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Save vcpkg binary cache
@@ -114,7 +236,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.VCPKG_CACHE_DIR }}
-          key: siteref-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
+          key: cs-vcpkg-v2-${{ env.VCPKG_TAG }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg/ports/**') }}
 
       - name: Configure and build
         shell: pwsh
@@ -143,9 +265,9 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-release `
             -DVCPKG_USE_LEGACY_APPLOCAL=ON `
-            -DCMAKE_INSTALL_PREFIX=install 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+            -DCMAKE_INSTALL_PREFIX=install 2>&1 | Tee-Object -FilePath $env:BUILD_LOG -Append
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ninja 2>&1 | Tee-Object -FilePath $env:SITEREF_LOG -Append
+          ninja 2>&1 | Tee-Object -FilePath $env:BUILD_LOG -Append
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Export package
@@ -162,7 +284,7 @@ jobs:
           # COLMAP only asks for them when built with CUDA.
           Remove-Item -Force -ErrorAction SilentlyContinue install/bin/onnxruntime_providers_cuda.dll, install/bin/onnxruntime_providers_tensorrt.dll
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue install/include,install/lib,install/share
-          # Licence texts of what's bundled, for SiteRef's THIRD_PARTY_LICENSES.md.
+          # Licence texts of what's bundled.
           New-Item -ItemType Directory -Force -Path install/licenses | Out-Null
           cp ../COPYING.txt install/licenses/COLMAP-COPYING.txt
           Get-ChildItem vcpkg_export/colmap/installed/x64-windows-release/share -Recurse -Filter copyright |
@@ -203,8 +325,8 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
-          if (Test-Path $env:SITEREF_LOG) {
-            $tail = (Get-Content $env:SITEREF_LOG -Tail 80) -join "`n"
+          if (Test-Path $env:BUILD_LOG) {
+            $tail = (Get-Content $env:BUILD_LOG -Tail 80) -join "`n"
             $msg = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Last lines of the build log::$msg"
           }
@@ -212,7 +334,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: colmap-x64-windows-siteref
+          name: colmap-cpu
           path: build/install
 
       - name: Cleanup compiler cache
